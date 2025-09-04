@@ -1,13 +1,373 @@
-<!doctype html>
-<html lang="id">
-<head>
-<meta charset="utf-8" />
-<meta name="viewport" content="width=device-width,initial-scale=1" />
-<title>ZAIN.NET Crypto Futures LONG/SHORT</title>
-<script src="https://unpkg.com/lightweight-charts@4.1.0/dist/lightweight-charts.standalone.production.js"></script>
-</head>
-<body>
-<h1>ZAIN.NET Crypto Futures</h1>
-<p>Template sudah disiapkan.</p>
-</body>
-</html>
+<script>
+// ======== UTILITIES ========
+const DOM=s=>document.querySelector(s);
+const fmt=(n,d=2)=>Number(n).toLocaleString(undefined,{maximumFractionDigits:d});
+function sleep(ms){return new Promise(r=>setTimeout(r,ms));}
+const PROXY='https://api.allorigins.win/raw?url=';
+
+// ======== FETCH ========
+async function tryFetch(url,retries=2){
+  const tries=[url, PROXY+encodeURIComponent(url)];
+  let lastErr=null;
+  for(const u of tries){
+    for(let i=0;i<=retries;i++){
+      try{
+        const r=await fetch(u,{cache:'no-store'});
+        if(!r.ok) throw new Error(`HTTP ${r.status}`);
+        const json=await r.json();
+        log(`fetched ${u}`);
+        return json;
+      }catch(e){ lastErr=e; await sleep(400*(i+1)); }
+    }
+  }
+  throw lastErr;
+}
+
+// ======== INDICATORS ========
+function SMA(data,p){const out=[];let s=0;for(let i=0;i<data.length;i++){s+=data[i];if(i>=p)s-=data[i-p];out.push(i>=p-1?s/p:null);}return out;}
+function EMA(data,p){const out=[];const k=2/(p+1);let prev=null;for(let i=0;i<data.length;i++){prev=prev===null?data[i]:(data[i]-prev)*k+prev;out.push(prev);}return out;}
+function RSI(closes,p=14){const out=Array(closes.length).fill(null);let g=0,l=0;for(let i=1;i<closes.length;i++){const d=closes[i]-closes[i-1];const gg=Math.max(d,0),ll=Math.max(-d,0);if(i<=p){g+=gg;l+=ll;if(i===p){const rs=g/Math.max(l,1e-9);out[i]=100-100/(1+rs);}}else{g=(g*(p-1)+gg)/p;l=(l*(p-1)+ll)/p;const rs=g/Math.max(l,1e-9);out[i]=100-100/(1+rs);}}return out;}
+function MACD(closes,f=12,s=26,sig=9){const emaF=EMA(closes,f),emaS=EMA(closes,s);const macd=emaF.map((v,i)=>v-emaS[i]);const sigLine=EMA(macd,sig);return {macd,sig:sigLine,hist:macd.map((v,i)=>v-sigLine[i])};}
+function BB(closes,p=20,mul=2){const sma=SMA(closes,p);return closes.map((c,i)=>{if(i<p-1)return null;const sd=Math.sqrt(closes.slice(i-p+1,i+1).reduce((a,b)=>a+(b-sma[i])**2,0)/p);return {upper:sma[i]+mul*sd,mid:sma[i],lower:sma[i]-mul*sd};});}
+function ATR(klines,p=14){
+  // klines: array of [open, high, low, close] or full kline. We'll accept array of closes with indices
+  const tr=[]; for(let i=1;i<klines.length;i++){
+    const high=+klines[i][2], low=+klines[i][3], prevClose=+klines[i-1][4];
+    tr.push(Math.max(high-low, Math.abs(high-prevClose), Math.abs(low-prevClose)));
+  }
+  const out=[]; let sum=0;
+  for(let i=0;i<tr.length;i++){
+    sum += tr[i];
+    if(i===p-1){ out[i+p]=sum/p; }
+    else if(i>=p){ out[i+p]=((out[i+p-1])*(p-1)+tr[i])/p; }
+  }
+  // align length to klines length, fill front with null
+  const res = Array(klines.length).fill(null);
+  for(let i=0;i<out.length;i++) if(out[i]!==undefined) res[i]=out[i];
+  return res;
+}
+
+// ======== CHART ========
+let chart=null, series=null;
+function initChart(){
+  if(chart) return;
+  chart=LightweightCharts.createChart(DOM('#chart'),{width:400,height:360,rightPriceScale:{borderVisible:false},timeScale:{borderVisible:false}});
+  series=chart.addCandlestickSeries();
+}
+
+// ======== HISTORY ========
+DOM('#clearHistory').onclick=()=>{localStorage.removeItem('zain_history');renderHistory();};
+DOM('#downloadHistory').onclick=()=>{
+  const data=localStorage.getItem('zain_history')||'[]';
+  const blob=new Blob([data],{type:'application/json'});
+  const url=URL.createObjectURL(blob);
+  const a=document.createElement('a'); a.href=url; a.download='history.json'; a.click();
+};
+function saveHistory(results){
+  const hist=JSON.parse(localStorage.getItem('zain_history')||'[]');
+  hist.push({time:new Date().toISOString(),results}); localStorage.setItem('zain_history',JSON.stringify(hist)); renderHistory();
+}
+function renderHistory(){
+  const hist=JSON.parse(localStorage.getItem('zain_history')||'[]');
+  DOM('#history').innerText=JSON.stringify(hist,null,2);
+}
+
+// ======== LOG ========
+function log(msg){const l=DOM('#log');l.innerText+=msg+'\n';l.scrollTop=l.scrollHeight;}
+
+// ======== EXTRA SIGNAL HELPERS ========
+function detectVolumeSpike(klines, lookback=20, threshold=2.0){
+  // klines: array from Binance klines (each k: k[5] is quoteVolume)
+  const vols = klines.slice(-Math.max(lookback, Math.min(klines.length, lookback))).map(k=>+k[5]);
+  if(vols.length===0) return false;
+  const avg = vols.reduce((a,b)=>a+b,0)/vols.length;
+  const lastVol = +klines[klines.length-1][5];
+  return {isSpike: lastVol > avg*threshold, lastVol, avg};
+}
+
+function detectEngulfing(klines){
+  // simple engulfing detection on last 2 candles
+  if(klines.length<3) return null;
+  const a = klines[klines.length-2], b = klines[klines.length-1];
+  const openA=+a[1], closeA=+a[4], openB=+b[1], closeB=+b[4];
+  // Bullish engulfing: previous bearish and current bullish and body engulfs
+  if(closeA < openA && closeB > openB && (closeB-openB) > (openA-closeA)) return 'Bullish Engulfing';
+  // Bearish engulfing
+  if(closeA > openA && closeB < openB && (openB-closeB) > (closeA-openA)) return 'Bearish Engulfing';
+  return null;
+}
+
+function pivotSupportResistance(closes, left=5, right=5){
+  // naive pivot high/low finder, returns arrays of pivots indices
+  const highs = closes.map(c=>+c);
+  const pivotsHigh = [], pivotsLow = [];
+  for(let i=left;i<highs.length-right;i++){
+    let isHigh=true, isLow=true;
+    for(let j=1;j<=left;j++){ if(highs[i-j]>=highs[i]) isHigh=false; if(highs[i-j]<=highs[i]) isLow=false; }
+    for(let j=1;j<=right;j++){ if(highs[i+j]>highs[i]) isHigh=false; if(highs[i+j]<highs[i]) isLow=false; }
+    if(isHigh) pivotsHigh.push({i, price:highs[i]});
+    if(isLow) pivotsLow.push({i, price:highs[i]});
+  }
+  return {pivotsHigh,pivotsLow};
+}
+
+// simple timeframe mapping for multi-timeframe confirmation
+const higherTfMap = {'1m':'5m','3m':'15m','5m':'15m','15m':'1h','1h':'4h','4h':'1d','1d':'1d'};
+
+// ======== SCORING WEIGHTS ========
+const WEIGHTS = {
+  goldenCross: 3,
+  deathCross: -3,
+  rsiOversold: 2,
+  rsiOverbought: -2,
+  macdBull: 2,
+  macdBear: -2,
+  volumeSpike: 3,
+  engulfingBull: 2,
+  engulfingBear: -2,
+  multiTfConfirm: 2,
+  multiTfOppose: -2
+};
+
+// ======== SCANNER ========
+let intervalId=null;
+DOM('#startBtn').onclick=startScan;
+DOM('#stopBtn').onclick=()=>{clearInterval(intervalId);DOM('#status').innerText='Stopped';};
+
+async function startScan(){
+  const tf=DOM('#tf').value, limit=+DOM('#limit').value;
+  const topN=+DOM('#topN').value, capital=+DOM('#capital').value, risk=+DOM('#risk').value;
+  DOM('#status').innerText='Scanning...'; log('Start scan');
+  const tickers=await tryFetch('https://fapi.binance.com/fapi/v1/ticker/24hr');
+  const coins=tickers.sort((a,b)=>+b.quoteVolume-+a.quoteVolume).slice(0,topN);
+  const results=[]; initChart();
+
+  // concurrency not implemented in deep parallel to keep code simple — iterating sequentially but can be optimized
+  for(const c of coins){
+    try{
+      const symbol=c.symbol;
+      const klines=await tryFetch(`https://fapi.binance.com/fapi/v1/klines?symbol=${symbol}&interval=${tf}&limit=${limit}`);
+      if(!klines || klines.length===0) { log(`no klines for ${symbol}`); continue; }
+      const closes = klines.map(k=>+k[4]);
+      const highs = klines.map(k=>+k[2]);
+      const lows = klines.map(k=>+k[3]);
+      const volumes = klines.map(k=>+k[5]);
+
+      const ema20 = EMA(closes,20), ema50 = EMA(closes,50), ema200 = EMA(closes,200);
+      const rsi = RSI(closes);
+      const macd = MACD(closes);
+      const bb = BB(closes);
+      const atrArr = ATR(klines,14); // aligned to klines
+      const lastPrice = closes[closes.length-1];
+
+      // Primary signals
+      let score = 0;
+      const reasons = [];
+
+      // Golden/Death Cross
+      const prevE50 = ema50[ema50.length-2], prevE200 = ema200[ema200.length-2];
+      const curE50 = ema50[ema50.length-1], curE200 = ema200[ema200.length-1];
+      if(prevE50!==null && prevE200!==null){
+        if(prevE50 < prevE200 && curE50 > curE200){ score += WEIGHTS.goldenCross; reasons.push('Golden Cross'); }
+        if(prevE50 > prevE200 && curE50 < curE200){ score += WEIGHTS.deathCross; reasons.push('Death Cross'); }
+      }
+
+      // RSI
+      const lastRsi = rsi[rsi.length-1];
+      if(lastRsi !== null){
+        if(lastRsi < 30){ score += WEIGHTS.rsiOversold; reasons.push('RSI oversold'); }
+        if(lastRsi > 70){ score += WEIGHTS.rsiOverbought; reasons.push('RSI overbought'); }
+      }
+
+      // MACD
+      const macdVal = macd.macd[macd.macd.length-1], sigVal = macd.sig[macd.sig.length-1];
+      if(macdVal !== null && sigVal !== null){
+        if(macdVal - sigVal > 0){ score += WEIGHTS.macdBull; reasons.push('MACD bullish'); }
+        if(macdVal - sigVal < 0){ score += WEIGHTS.macdBear; reasons.push('MACD bearish'); }
+      }
+
+      // Volume spike
+      const volSpike = detectVolumeSpike(klines, 20, 2.0);
+      if(volSpike && volSpike.isSpike){ score += WEIGHTS.volumeSpike; reasons.push('Volume spike'); }
+
+      // Candlestick pattern
+      const engulf = detectEngulfing(klines);
+      if(engulf === 'Bullish Engulfing'){ score += WEIGHTS.engulfingBull; reasons.push('Bullish Engulfing'); }
+      if(engulf === 'Bearish Engulfing'){ score += WEIGHTS.engulfingBear; reasons.push('Bearish Engulfing'); }
+
+      // Multi-timeframe confirmation (check higher TF EMA200 trend)
+      const higherTf = higherTfMap[tf] || tf;
+      let multiTfConfirm = null;
+      if(higherTf !== tf){
+        try{
+          // get enough candles for EMA200 on higher tf, request limit 300
+          const klinesHigh = await tryFetch(`https://fapi.binance.com/fapi/v1/klines?symbol=${symbol}&interval=${higherTf}&limit=300`);
+          const closesHigh = klinesHigh.map(k=>+k[4]);
+          const ema200High = EMA(closesHigh,200);
+          const prevE200H = ema200High[ema200High.length-2], curE200H = ema200High[ema200High.length-1];
+          if(prevE200H!==null && curE200H!==null){
+            if(curE200H > prevE200H){ multiTfConfirm = 'up'; score += WEIGHTS.multiTfConfirm; reasons.push(`Higher TF (${higherTf}) trend up`); }
+            if(curE200H < prevE200H){ multiTfConfirm = 'down'; score += WEIGHTS.multiTfOppose; reasons.push(`Higher TF (${higherTf}) trend down`); }
+          }
+        }catch(e){ log(`multi-tf fetch fail ${symbol} ${higherTf}`); }
+      }
+
+      // Support/Resistance (pivots) on closes
+      const pivots = pivotSupportResistance(closes,5,5);
+      // Use last pivot low as support if exists
+      const lastPivotLow = pivots.pivotsLow.length? pivots.pivotsLow[pivots.pivotsLow.length-1].price : null;
+      const lastPivotHigh = pivots.pivotsHigh.length? pivots.pivotsHigh[pivots.pivotsHigh.length-1].price : null;
+
+      // Determine direction bias (simple): compare EMA20 to EMA200
+      const ema20Val = ema20[ema20.length-1], ema200Val = ema200[ema200.length-1];
+      let bias = 'neutral';
+      if(ema20Val !== null && ema200Val !== null){
+        bias = ema20Val > ema200Val ? 'bull' : (ema20Val < ema200Val ? 'bear' : 'neutral');
+        reasons.push(`EMA20:${fmt(ema20Val,4)} vs EMA200:${fmt(ema200Val,4)} (${bias})`);
+      }
+
+      // ATR based SL/TP if available
+      const atrVal = atrArr[atrArr.length-1];
+      let stopLoss, tp1, tp2, tp3;
+      if(atrVal && atrVal>0){
+        // If bias bull -> long targets above
+        if(bias === 'bull' || score > 0){
+          stopLoss = Math.max(lastPrice - atrVal*1.0, lastPrice*0.98);
+          tp1 = lastPrice + atrVal*2.0;
+          tp2 = lastPrice + atrVal*3.5;
+          tp3 = lastPrice + atrVal*5.0;
+        }else if(bias === 'bear' || score < 0){
+          stopLoss = Math.min(lastPrice + atrVal*1.0, lastPrice*1.02);
+          tp1 = lastPrice - atrVal*2.0;
+          tp2 = lastPrice - atrVal*3.5;
+          tp3 = lastPrice - atrVal*5.0;
+        }else{
+          // neutral fallback to small percent
+          stopLoss = lastPrice*0.99;
+          tp1 = lastPrice*1.01;
+          tp2 = lastPrice*1.03;
+          tp3 = lastPrice*1.05;
+        }
+      }else{
+        // fallback fixed percent as before
+        if(bias === 'bull' || score>0){
+          stopLoss = lastPrice*0.98;
+          tp1 = lastPrice*1.02;
+          tp2 = lastPrice*1.04;
+          tp3 = lastPrice*1.06;
+        }else if(bias === 'bear' || score<0){
+          stopLoss = lastPrice*1.02;
+          tp1 = lastPrice*0.98;
+          tp2 = lastPrice*0.96;
+          tp3 = lastPrice*0.94;
+        }else{
+          stopLoss = lastPrice*0.99;
+          tp1 = lastPrice*1.01;
+          tp2 = lastPrice*1.03;
+          tp3 = lastPrice*1.05;
+        }
+      }
+
+      // Determine direction final: if score > 0 -> LONG, score < 0 -> SHORT, else NEUTRAL
+      const long = score > 0;
+      const short = score < 0;
+
+      // Position sizing: use price difference vs SL, but avoid divide by zero
+      const gap = Math.abs(lastPrice - stopLoss) || (lastPrice*0.01);
+      const positionSize = (capital * (risk/100)) / gap;
+
+      // Risk:Reward ratio for each TP
+      const rr1 = Math.abs((tp1 - lastPrice) / (lastPrice - stopLoss)) || null;
+      const rr2 = Math.abs((tp2 - lastPrice) / (lastPrice - stopLoss)) || null;
+      const rr3 = Math.abs((tp3 - lastPrice) / (lastPrice - stopLoss)) || null;
+
+      // Score normalization (for sorting): keep raw numeric score
+      const normalizedScore = score;
+
+      // Collect fib levels
+      const recentHigh = Math.max(...closes.slice(-50)), recentLow = Math.min(...closes.slice(-50));
+      const fibLevels = [0,0.236,0.382,0.5,0.618,0.786,1].map(f=>recentLow + (recentHigh - recentLow)*f);
+
+      // Push result
+      results.push({
+        symbol,
+        lastPrice,
+        long,
+        short,
+        score: normalizedScore,
+        reasons,
+        stopLoss, tp1, tp2, tp3,
+        positionSize,
+        rr:{tp1:rr1,tp2:rr2,tp3:rr3},
+        fibLevels,
+        atr: atrVal,
+        volume:{last:volSpike?volSpike.lastVol:null,avg:volSpike?volSpike.avg:null,spike:volSpike?volSpike.isSpike:false},
+        pivot:{lastPivotLow, lastPivotHigh},
+        bias,
+        multiTfConfirm
+      });
+
+      // quick chart for top coin
+      await sleep(150);
+      if(symbol===coins[0].symbol){
+        series.setData(klines.map(k=>({time:k[0]/1000,open:+k[1],high:+k[2],low:+k[3],close:+k[4]})));
+        DOM('#chartInfo').innerText=`Chart for ${symbol} | ATR:${atrVal?fmt(atrVal,6):'n/a'} | Bias:${bias} | Fib: ${fibLevels.map(f=>fmt(f)).join(', ')}`;
+      }
+    }catch(e){
+      log(`error scanning ${c.symbol}: ${e.message}`);
+    }
+  }
+
+  renderResults(results);
+  saveHistory(results);
+  DOM('#status').innerText='Idle';
+}
+
+// ======== RENDER ========
+function renderResults(results){
+  const filter=DOM('#filter').value;
+  const list=DOM('#list'); list.innerHTML='';
+
+  // Sort by custom sort selector
+  const sortBy = DOM('#sort').value;
+  results.sort((a,b)=>{
+    if(sortBy==='volume') return (b.volume.last||0) - (a.volume.last||0);
+    if(sortBy==='change') return (b.lastPrice - a.lastPrice) - (a.lastPrice - b.lastPrice); // placeholder
+    if(sortBy==='score') return b.score - a.score;
+    if(sortBy==='symbol') return a.symbol.localeCompare(b.symbol);
+    return 0;
+  });
+
+  for(const r of results){
+    if(filter!=='all'){
+      if(filter==='long' && !r.long) continue;
+      if(filter==='short' && !r.short) continue;
+      if(filter==='neutral' && (r.long || r.short)) continue;
+    }
+    const div=document.createElement('div'); div.className='coin';
+    const badge = r.long ? 'LONG' : r.short ? 'SHORT' : 'NEUTRAL';
+    const pillClass = r.long ? 'long' : r.short ? 'short' : 'neutral';
+    div.innerHTML = `
+      <div style="display:flex;justify-content:space-between;align-items:center">
+        <div><strong>${r.symbol}</strong> <span class="small muted">(${r.bias})</span></div>
+        <div><span class="pill ${pillClass}">${badge}</span></div>
+      </div>
+      <div>Price: ${fmt(r.lastPrice)}</div>
+      <div>Score: <strong>${r.score}</strong> | ATR: ${r.atr?fmt(r.atr,6):'n/a'} | VolSpike: ${r.volume.spike ? 'YES' : 'NO'}</div>
+      <div>SL: ${fmt(r.stopLoss)} | TP1: ${fmt(r.tp1)} (R:${r.rr.tp1?fmt(r.rr.tp1,2):'n/a'}) | TP2: ${fmt(r.tp2)} (R:${r.rr.tp2?fmt(r.rr.tp2,2):'n/a'})</div>
+      <div>Size: ${fmt(r.positionSize)}</div>
+      <div class="signal-desc"><strong>Reasons:</strong> ${r.reasons.join(' • ')}</div>
+      <div class="signal-desc">Fib: ${r.fibLevels.map(f=>fmt(f)).join(', ')}</div>
+      <div class="signal-desc">Pivot Low: ${r.pivot.lastPivotLow?fmt(r.pivot.lastPivotLow):'n/a'} | Pivot High: ${r.pivot.lastPivotHigh?fmt(r.pivot.lastPivotHigh):'n/a'}</div>
+    `;
+    list.appendChild(div);
+  }
+
+  // KPIs (top counts)
+  const kpis = DOM('#kpis'); kpis.innerHTML = '';
+  const longs = results.filter(r=>r.long).length;
+  const shorts = results.filter(r=>r.short).length;
+  const neutrals = results.filter(r=>!r.long && !r.short).length;
+  kpis.innerHTML = `<div class="box small muted">LONG: ${longs}</div><div class="box small muted">SHORT: ${shorts}</div><div class="box small muted">NEUTRAL: ${neutrals}</div>`;
+}
+</script>
